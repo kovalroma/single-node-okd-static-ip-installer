@@ -1,0 +1,184 @@
+---
+- name: Build single node static IP OKD ISO file
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    okd_version: "4.15.0-0.okd-2024-03-10-010116"
+    arch: "x86_64"
+    base_folder: "/home/user/okd_iso_temp"
+    base_folder_prod: "/home/user/okd_iso"
+    # Cluster configuration
+    cluster_base_domain: "cn.ibm.com"
+    cluster_name: "sno-test"
+    cluster_cluster_networks_cidr: "10.128.0.0/14"
+    cluster_cluster_networks_hostprefix: "23"
+    cluster_service_network: "172.30.0.0/16"
+    # IP adress virtual machine for OKD single node
+    cluster_vm_machine_ip: "192.168.0.1"
+    # Virtual machine network adress with mask
+    cluster_machine_network: "192.168.0.0/24"
+    # Gateway ip adress virtual machine for OKD single node
+    cluster_vm_machine_gateway: "192.168.0.254"
+    # IP adress mask virtual machine for OKD single node
+    cluster_vm_machine_ip_mask: "255.255.255.0"
+    # Virtual machine interface name
+    cluster_vm_machine_interface_name: "eth0"
+    # DNS IP adress virtual machine for OKD single node
+    cluster_vm_machine_ip_dns: "8.8.8.8"
+    # Virtual machine disk path
+    cluster_installationdisk: "/dev/sda"
+    # Dummy pull secret for OKD. Fix bypass for pull-secret https://github.com/okd-project/okd/issues/182
+    pull_secret: '{"auths":{"fake":{"auth":"aWQ6cGFzcwo="}}}'
+    # SSH public key for virtual machine
+    ssh_key: "ssh-rsa"
+    is_debug: false
+
+  tasks:
+    - name: Check if external_vars.yml exists
+      ansible.builtin.stat:
+        path: external_vars.yml
+      register: external_vars_file
+
+    - name: Include external_vars.yml if it exists
+      ansible.builtin.include_vars: external_vars.yml
+      when: external_vars_file.stat.exists
+
+    - name: Ensure base folder exist
+      ansible.builtin.file:
+        path: "{{ base_folder }}"
+        state: directory
+        mode: "0750"
+
+    - name: Ensure base folder prod exist
+      ansible.builtin.file:
+        path: "{{ base_folder_prod }}"
+        state: directory
+        mode: "0750"
+
+    - name: Download the OKD client
+      ansible.builtin.get_url:
+        url: https://github.com/okd-project/okd/releases/download/{{ okd_version }}/openshift-client-linux-{{ okd_version }}.tar.gz
+        dest: "{{ base_folder }}"
+        mode: "0640"
+
+    - name: Extract oc client
+      ansible.builtin.unarchive:
+        src: "{{ base_folder }}/openshift-client-linux-{{ okd_version }}.tar.gz"
+        dest: "{{ base_folder }}"
+
+    - name: Ensure the downloaded openshift-client-linux file is executable
+      ansible.builtin.file:
+        path: "{{ base_folder }}/oc"
+        mode: a+x
+
+    - name: Download the OKD installer
+      ansible.builtin.get_url:
+        url: https://github.com/okd-project/okd/releases/download/{{ okd_version }}/openshift-install-linux-{{ okd_version }}.tar.gz
+        dest: "{{ base_folder }}"
+        mode: "0640"
+
+    - name: Extract openshift installer
+      ansible.builtin.unarchive:
+        src: "{{ base_folder }}/openshift-install-linux-{{ okd_version }}.tar.gz"
+        dest: "{{ base_folder }}"
+
+    - name: Ensure the downloaded openshift-install file is executable
+      ansible.builtin.file:
+        path: "{{ base_folder }}/openshift-install"
+        mode: '0755'
+
+    - name: Retrieve the FCOS ISO URL
+      ansible.builtin.shell: |
+        set -o pipefail
+        ISO_URL=$({{ base_folder }}/openshift-install coreos print-stream-json | grep location | grep {{ arch }} | grep iso | cut -d\" -f4)
+        echo $ISO_URL
+      register: iso_url_result
+      changed_when: false
+
+    - name: Verify ISO URL
+      ansible.builtin.debug:
+        msg: "The ISO URL is {{ iso_url_result.stdout }}"
+
+    - name: Download the FCOS ISO file
+      ansible.builtin.get_url:
+        url: "{{ iso_url_result.stdout }}"
+        dest: "{{ base_folder }}/fedora-coreos.iso"
+        mode: "0644"
+
+    - name: Create a folder for single node ignition file
+      ansible.builtin.file:
+        path: "{{ base_folder }}/sno"
+        state: directory
+        mode: "0750"
+
+    - name: Generate install-config.yaml
+      ansible.builtin.template:
+        src: ./templates/install-config.yaml.j2
+        dest: "{{ base_folder }}/sno/install-config.yaml"
+        mode: "0644"
+
+    - name: Generate a copy of install-config.yaml
+      ansible.builtin.template:
+        src: ./templates/install-config.yaml.j2
+        dest: "{{ base_folder }}/install-config.yaml"
+        mode: "0644"
+      when: is_debug
+
+    - name: Create single node ignition file
+      ansible.builtin.shell: |
+        ({{ base_folder }}/openshift-install --dir={{ base_folder }}/sno create single-node-ignition-config)
+      register: create_ignition_file_result
+      changed_when: true
+
+    - name: Generate install-to-disk-customized.sh file
+      ansible.builtin.template:
+        src: ./templates/install-to-disk-customized.sh.j2
+        dest: "{{ base_folder }}/sno/install-to-disk-customized.sh"
+        mode: "0644"
+
+    - name: Make a copy of original bootstrap ign file
+      ansible.builtin.copy:
+        src: "{{ base_folder }}/sno/bootstrap-in-place-for-live-iso.ign"
+        dest: "{{ base_folder }}/sno/iso.ign"
+        mode: "0644"
+
+    - name: Generate single node ignition file
+      ansible.builtin.shell: |
+        set -o pipefail
+        newb64=$(cat "{{ base_folder }}/sno/install-to-disk-customized.sh" |base64 -w0)
+        echo $newb64
+        sed -i "s/IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLWV1b0UgcGlwZWZhaWwgIyMgLUUgb3B0aW9uIHdpbGwgY2F1c2UgZnVuY3Rpb25zIHRvIGluaGVyaXQgdHJhcAoKIyBUaGlzIHNjcmlwdCBpcyBleGVjdXRlZCBieSBpbnN0YWxsLXRvLWRpc2sgc2VydmljZSB3aGVuIGluc3RhbGxpbmcgc2luZ2xlIG5vZGUgd2l0aCBib290c3RyYXAgaW4gcGxhY2UKCi4gL3Vzci9sb2NhbC9iaW4vYm9vdHN0cmFwLXNlcnZpY2UtcmVjb3JkLnNoCgpyZWNvcmRfc2VydmljZV9zdGFnZV9zdGFydCAid2FpdC1mb3ItYm9vdGt1YmUiCmVjaG8gIldhaXRpbmcgZm9yIC9vcHQvb3BlbnNoaWZ0Ly5ib290a3ViZS5kb25lIgp1bnRpbCBbIC1mIC9vcHQvb3BlbnNoaWZ0Ly5ib290a3ViZS5kb25lIF07IGRvCiAgc2xlZXAgNQpkb25lCnJlY29yZF9zZXJ2aWNlX3N0YWdlX3N1Y2Nlc3MKCmlmIFsgISAtZiBjb3Jlb3MtaW5zdGFsbGVyLmRvbmUgXTsgdGhlbgogIHJlY29yZF9zZXJ2aWNlX3N0YWdlX3N0YXJ0ICJjb3Jlb3MtaW5zdGFsbGVyIgogICMgV3JpdGUgaW1hZ2UgKyBpZ25pdGlvbiB0byBkaXNrCiAgZWNobyAiRXhlY3V0aW5nIGNvcmVvcy1pbnN0YWxsZXIgd2l0aCB0aGUgZm9sbG93aW5nIG9wdGlvbnM6IGluc3RhbGwgLWkgL29wdC9vcGVuc2hpZnQvbWFzdGVyLmlnbiAvZGV2L3NkYSIKICBjb3Jlb3MtaW5zdGFsbGVyIGluc3RhbGwgLWkgL29wdC9vcGVuc2hpZnQvbWFzdGVyLmlnbiAvZGV2L3NkYQoKICB0b3VjaCBjb3Jlb3MtaW5zdGFsbGVyLmRvbmUKICByZWNvcmRfc2VydmljZV9zdGFnZV9zdWNjZXNzCmZpCgpyZWNvcmRfc2VydmljZV9zdGFnZV9zdGFydCAicmVib290IgplY2hvICJHb2luZyB0byByZWJvb3QiCnNodXRkb3duIC1yICsxICJCb290c3RyYXAgY29tcGxldGVkLCBzZXJ2ZXIgaXMgZ29pbmcgdG8gcmVib290LiIKdG91Y2ggL29wdC9vcGVuc2hpZnQvLmluc3RhbGwtdG8tZGlzay5kb25lCmVjaG8gIkRvbmUiCnJlY29yZF9zZXJ2aWNlX3N0YWdlX3N1Y2Nlc3MK/${newb64}/g" "{{ base_folder }}/sno/iso.ign"
+      changed_when: true
+
+    - name: Embed the bootstrap ign file to CoreOS live ISO file.
+      ansible.builtin.shell: |
+        set -o pipefail
+        podman run --privileged --rm -v /dev:/dev -v /run/udev:/run/udev -v {{ base_folder }}:/data -w /data quay.io/coreos/coreos-installer:release iso ignition embed -fi "/data/sno/iso.ign" "/data/fedora-coreos.iso"
+      register: embed_sno_ignition_file_result
+      changed_when: true
+
+    - name: Add static IP setting to ISO kernel arguments.
+      ansible.builtin.shell: |
+        set -o pipefail
+        podman run --privileged --rm -v /dev:/dev -v /run/udev:/run/udev -v {{ base_folder }}:/data -w /data quay.io/coreos/coreos-installer:release iso kargs modify -a "ip={{ cluster_vm_machine_ip }}::{{ cluster_vm_machine_gateway }}:{{ cluster_vm_machine_ip_mask }}:{{ cluster_name }}:{{ cluster_vm_machine_interface_name }}:off:{{ cluster_vm_machine_ip_dns }}"  /data/fedora-coreos.iso
+      register: embed_sno_ignition_file_result
+      changed_when: true
+
+    - name: Copy ISO to the prod folder
+      ansible.builtin.copy:
+        src: "{{ base_folder }}/fedora-coreos.iso"
+        dest: "{{ base_folder_prod }}"
+        mode: "0644"
+
+    - name: Copy auth data
+      ansible.builtin.copy:
+        src: "{{ base_folder }}/sno/auth"
+        dest: "{{ base_folder_prod }}"
+        mode: "0644"
+
+    - name: Clean working directory
+      ansible.builtin.file:
+        path: "{{ base_folder }}"
+        state: absent
+      when: not is_debug
